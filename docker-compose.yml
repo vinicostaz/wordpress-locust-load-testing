@@ -1,0 +1,144 @@
+# Configuracao compartilhada pelas tres instancias WordPress.
+# O anchor evita repetir imagem, banco, volume, redes e healthcheck.
+x-wordpress-common: &wordpress-common
+  image: wordpress:5.4.2-php7.2-apache
+  restart: unless-stopped
+  environment:
+    WORDPRESS_DB_HOST: mysql:3306
+    WORDPRESS_DB_USER: ${MYSQL_USER:-wordpress}
+    WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD:?Defina MYSQL_PASSWORD no arquivo .env}
+    WORDPRESS_DB_NAME: ${MYSQL_DATABASE:-wordpress}
+    WORDPRESS_CONFIG_EXTRA: |
+      define('WP_HOME', 'http://' . ($$_SERVER['HTTP_HOST'] ?? '${SITE_HOST_HEADER:-localhost:8080}'));
+      define('WP_SITEURL', 'http://' . ($$_SERVER['HTTP_HOST'] ?? '${SITE_HOST_HEADER:-localhost:8080}'));
+  volumes:
+    # Todas as instancias enxergam os mesmos arquivos do WordPress.
+    - ./wordpress_data:/var/www/html
+  networks:
+    - frontend
+    - backend
+  healthcheck:
+    test: ["CMD-SHELL", "test -f /var/www/html/wp-includes/version.php && test -f /var/www/html/wp-config.php && php -r 'exit(@fsockopen(\"127.0.0.1\", 80) ? 0 : 1);'"]
+    interval: 3s
+    timeout: 3s
+    retries: 30
+    start_period: 10s
+
+services:
+  # Banco unico compartilhado por todas as instancias WordPress.
+  mysql:
+    image: mysql:5.7
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Defina MYSQL_ROOT_PASSWORD no arquivo .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-wordpress}
+      MYSQL_USER: ${MYSQL_USER:-wordpress}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Defina MYSQL_PASSWORD no arquivo .env}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # As instancias possuem nomes fixos para que o script possa liga-las
+  # ou para-las individualmente durante os testes.
+  wordpress1:
+    <<: *wordpress-common
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  wordpress2:
+    <<: *wordpress-common
+    depends_on:
+      mysql:
+        condition: service_healthy
+      wordpress1:
+        condition: service_healthy
+
+  wordpress3:
+    <<: *wordpress-common
+    depends_on:
+      mysql:
+        condition: service_healthy
+      wordpress1:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.19.0
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PORT:-8080}:80"
+    volumes:
+      # WORDPRESS_INSTANCES escolhe nginx-1.conf, nginx-2.conf ou nginx-3.conf.
+      - ./nginx/nginx-${WORDPRESS_INSTANCES:-3}.conf:/etc/nginx/nginx.conf:ro
+      - ./wordpress_data:/usr/share/nginx/html:ro
+    networks:
+      - frontend
+    depends_on:
+      wordpress1:
+        condition: service_healthy
+
+  locust:
+    image: locustio/locust:2.33.2
+    ports:
+      - "${LOCUST_PORT:-8089}:8089"
+    environment:
+      # O mesmo locustfile atende aos tres cenarios; esta variavel escolhe um.
+      SCENARIO: imagem_1mb
+      SITE_HOST_HEADER: ${SITE_HOST_HEADER:-localhost:8080}
+      SCENARIO_CONFIG: /mnt/runtime/scenarios.json
+    volumes:
+      - ./locust:/mnt/locust:ro
+      - ./runtime:/mnt/runtime:ro
+      - ./results:/mnt/results
+    # A carga sempre entra pelo Nginx, nunca diretamente pelo WordPress.
+    command: -f /mnt/locust/locustfile.py --host http://nginx
+    networks:
+      - frontend
+    depends_on:
+      - nginx
+
+  content-setup:
+    image: python:3.12-alpine
+    profiles: ["tools"]
+    environment:
+      TARGET_URL: http://nginx
+      SITE_URL: http://${SITE_HOST_HEADER:-localhost:8080}
+      SITE_HOST_HEADER: ${SITE_HOST_HEADER:-localhost:8080}
+      WP_SITE_TITLE: ${WP_SITE_TITLE:-WordPress Load Test}
+      WP_ADMIN_USER: ${WP_ADMIN_USER:-admin}
+      WP_ADMIN_PASSWORD: ${WP_ADMIN_PASSWORD:?Defina WP_ADMIN_PASSWORD no arquivo .env}
+      WP_ADMIN_EMAIL: ${WP_ADMIN_EMAIL:-admin@example.com}
+    volumes:
+      - ./scripts:/work/scripts:ro
+      - ./wordpress_data:/var/www/html
+      - ./runtime:/work/runtime
+    command: python /work/scripts/setup_content.py
+    networks:
+      - frontend
+    depends_on:
+      - nginx
+
+  report:
+    build:
+      context: ./report
+    profiles: ["tools"]
+    volumes:
+      - ./scripts:/work/scripts:ro
+      - ./results:/work/results
+      - ./graphs:/work/graphs
+    command: python /work/scripts/generate_report.py
+
+volumes:
+  mysql_data:
+
+networks:
+  frontend:
+  backend:
+    internal: true

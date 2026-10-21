@@ -1,0 +1,2 @@
+scenario,instances,users,duration_seconds,spawn_rate,locust_processes,executed_at
+imagem_1mb,1,10,20,1,2,2026-10-20T19:16:24-03:00
